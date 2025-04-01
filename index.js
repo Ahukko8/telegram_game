@@ -1,3 +1,4 @@
+import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, collection, getDocs, doc, setDoc, getDoc } from 'firebase/firestore';
@@ -5,6 +6,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+const app = express();
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
 // Firebase Configuration
@@ -17,17 +19,13 @@ const firebaseConfig = {
   appId: process.env.FIREBASE_APP_ID
 };
 
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp);
 
 async function fetchNamesOfAllah() {
   const namesCollection = collection(db, "namesOfAllah");
   const snapshot = await getDocs(namesCollection);
-  let names = [];
-  snapshot.forEach((doc) => {
-    names.push(doc.data());
-  });
-  return names;
+  return snapshot.docs.map(doc => doc.data());
 }
 
 async function getUserProgress(userId) {
@@ -52,13 +50,10 @@ async function getUsername(userId) {
 }
 
 async function generateQuiz(userId) {
-  let allNames = await fetchNamesOfAllah();
-  let userProgress = await getUserProgress(userId);
-  let askedQuestions = userProgress.askedQuestions || [];
-
-  let availableQuestions = allNames.filter(n => !askedQuestions.includes(n.name));
+  const allNames = await fetchNamesOfAllah();
+  const userProgress = await getUserProgress(userId);
+  let availableQuestions = allNames.filter(n => !userProgress.askedQuestions.includes(n.name));
   if (availableQuestions.length < 10) availableQuestions = allNames;
-
   let selectedQuestions = availableQuestions.sort(() => 0.5 - Math.random()).slice(0, 10);
   return { selectedQuestions, askedQuestions: selectedQuestions.map(q => q.name) };
 }
@@ -70,82 +65,79 @@ bot.start((ctx) => {
   );
 });
 
-let userSessions = {};
+const userSessions = {};
 
 bot.hears('Start Quiz', async (ctx) => {
-  let userId = ctx.from.id;
-  let username = ctx.from.username || `User${userId}`;
-  await saveUsername(userId, username);
-  
-  let { selectedQuestions, askedQuestions } = await generateQuiz(userId);
+  const userId = ctx.from.id;
+  await saveUsername(userId, ctx.from.username || `User${userId}`);
+  const { selectedQuestions, askedQuestions } = await generateQuiz(userId);
   userSessions[userId] = { questions: selectedQuestions, current: 0, score: 0, askedQuestions };
   sendQuestion(ctx, userId);
 });
 
 async function sendQuestion(ctx, userId) {
-  let session = userSessions[userId];
+  const session = userSessions[userId];
   if (!session || session.current >= session.questions.length) {
     ctx.reply(`Quiz finished! Your score: ${session?.score || 0}/10`);
     await updateUserProgress(userId, session.score, session.askedQuestions);
     delete userSessions[userId];
     return;
   }
-
-  let question = session.questions[session.current];
-  let allNames = await fetchNamesOfAllah();
-  let options = allNames.filter(n => n.name !== question.name).sort(() => 0.5 - Math.random()).slice(0, 3);
+  const question = session.questions[session.current];
+  let options = (await fetchNamesOfAllah())
+    .filter(n => n.name !== question.name)
+    .sort(() => 0.5 - Math.random())
+    .slice(0, 3);
   options.push(question);
   options = options.sort(() => 0.5 - Math.random());
 
   ctx.reply(
     `What is the meaning of *${question.name}*?`,
-    Markup.inlineKeyboard(options.map((opt, index) => [Markup.button.callback(opt.meaning, `answer_${userId}_${index}_${opt.name === question.name}`)]))
+    Markup.inlineKeyboard(
+      options.map((opt) => [Markup.button.callback(opt.meaning, `answer_${userId}_${opt.name === question.name}`)])
+    )
   );
 }
 
-bot.action(/answer_(\d+)_(\d+)_(true|false)/, async (ctx) => {
-  let userId = parseInt(ctx.match[1]);
-  let correct = ctx.match[3] === 'true';
-  
+bot.action(/answer_(\d+)_(true|false)/, async (ctx) => {
+  const userId = parseInt(ctx.match[1]);
+  const correct = ctx.match[2] === 'true';
   if (!userSessions[userId]) return;
   if (correct) userSessions[userId].score++;
   userSessions[userId].current++;
-  
   ctx.reply(correct ? "✅ Correct!" : "❌ Wrong!");
   sendQuestion(ctx, userId);
 });
 
 bot.hears('Quit Quiz', (ctx) => {
-  let userId = ctx.from.id;
+  const userId = ctx.from.id;
   delete userSessions[userId];
   ctx.reply("Quiz stopped.", Markup.keyboard([['Start Quiz'], ['User Progress', 'Leaderboard']]).resize());
 });
 
 bot.hears('User Progress', async (ctx) => {
-  let userId = ctx.from.id;
-  let progress = await getUserProgress(userId);
+  const userId = ctx.from.id;
+  const progress = await getUserProgress(userId);
   ctx.reply(`Your current score: ${progress.score}`);
 });
 
 bot.hears('Leaderboard', async (ctx) => {
   const leaderboardSnap = await getDocs(collection(db, "user_progress"));
   let leaderboard = [];
-  
-  for (let docSnap of leaderboardSnap.docs) {
-    let data = docSnap.data();
-    let userId = docSnap.id;
-    let username = await getUsername(userId);
+  for (const docSnap of leaderboardSnap.docs) {
+    const data = docSnap.data();
+    const username = await getUsername(docSnap.id);
     leaderboard.push({ username, score: data.score });
   }
-
   leaderboard.sort((a, b) => b.score - a.score);
-  
-  let message = "🏆 Leaderboard 🏆\n\n";
-  leaderboard.slice(0, 5).forEach((entry, i) => {
-    message += `${i + 1}. @${entry.username}: ${entry.score} points\n`;
-  });
-
+  const message = "🏆 Leaderboard 🏆\n\n" +
+    leaderboard.slice(0, 5).map((entry, i) => `${i + 1}. @${entry.username}: ${entry.score} points`).join('\n');
   ctx.reply(message);
 });
 
 bot.launch();
+
+// Express Server for Render Keep-Alive
+app.get('/', (req, res) => res.send('Bot is running!'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
