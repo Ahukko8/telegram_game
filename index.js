@@ -22,6 +22,8 @@ const firebaseConfig = {
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp);
 
+const userSessions = {};
+
 async function fetchNamesOfAllah() {
     const namesCollection = collection(db, "namesOfAllah");
     const snapshot = await getDocs(namesCollection);
@@ -31,30 +33,28 @@ async function fetchNamesOfAllah() {
 async function getUserProgress(userId) {
     const userRef = doc(db, "user_progress", userId.toString());
     const userSnap = await getDoc(userRef);
-    return userSnap.exists() ? userSnap.data() : { score: 0, askedQuestions: [] };
+    return userSnap.exists() ? userSnap.data() : { level: 1, score: 0, askedQuestions: [] };
 }
 
-async function updateUserProgress(userId, score, askedQuestions) {
-    await setDoc(doc(db, "user_progress", userId.toString()), { score, askedQuestions });
-}
-
-async function saveUsername(userId, username) {
-    if (!username) return;
-    await setDoc(doc(db, "usernames", userId.toString()), { username });
+async function updateUserProgress(userId, username, level, score, askedQuestions) {
+    await setDoc(doc(db, "user_progress", userId.toString()), { username, level, score, askedQuestions });
 }
 
 async function getUsername(userId) {
-    const usernameRef = doc(db, "usernames", userId.toString());
-    const usernameSnap = await getDoc(usernameRef);
-    return usernameSnap.exists() ? usernameSnap.data().username : `User${userId}`;
+    const userRef = doc(db, "user_progress", userId.toString());
+    const userSnap = await getDoc(userRef);
+    return userSnap.exists() ? userSnap.data().username || `User${userId}` : `User${userId}`;
 }
 
 async function generateQuiz(userId) {
     const allNames = await fetchNamesOfAllah();
     const userProgress = await getUserProgress(userId);
-    let availableQuestions = allNames.filter(n => !userProgress.askedQuestions.includes(n.name));
-    if (availableQuestions.length < 10) availableQuestions = allNames;
-    let selectedQuestions = availableQuestions.sort(() => 0.5 - Math.random()).slice(0, 10);
+    const level = userProgress.level;
+
+    let levelQuestions = allNames.filter(n => n.level === level && !userProgress.askedQuestions.includes(n.name));
+    if (levelQuestions.length < 10) levelQuestions = allNames.filter(n => n.level === level);
+    let selectedQuestions = levelQuestions.sort(() => 0.5 - Math.random()).slice(0, 10);
+    
     return { selectedQuestions, askedQuestions: selectedQuestions.map(q => q.name) };
 }
 
@@ -65,13 +65,11 @@ bot.start((ctx) => {
     );
 });
 
-const userSessions = {};
-
 bot.hears('Start Quiz', async (ctx) => {
     const userId = ctx.from.id;
-    await saveUsername(userId, ctx.from.username || `User${userId}`);
+    const username = ctx.from.username || `User${userId}`;
     const { selectedQuestions, askedQuestions } = await generateQuiz(userId);
-    userSessions[userId] = { questions: selectedQuestions, current: 0, score: 0, askedQuestions };
+    userSessions[userId] = { username, questions: selectedQuestions, current: 0, score: 0, askedQuestions };
     sendQuestion(ctx, userId);
 });
 
@@ -79,76 +77,52 @@ async function sendQuestion(ctx, userId) {
     const session = userSessions[userId];
     if (!session || session.current >= session.questions.length) {
         ctx.reply(`Quiz finished! Your score: ${session?.score || 0}/10`);
-        await updateUserProgress(userId, session.score, session.askedQuestions);
+        const userProgress = await getUserProgress(userId);
+        const newLevel = session.score >= 5 ? userProgress.level + 1 : userProgress.level;
+        await updateUserProgress(userId, session.username, newLevel, session.score, session.askedQuestions);
         delete userSessions[userId];
         return;
     }
 
     const question = session.questions[session.current];
-    let options = (await fetchNamesOfAllah())
-        .filter(n => n.name !== question.name)
-        .sort(() => 0.5 - Math.random())
-        .slice(0, 3);
-    
+    let options = (await fetchNamesOfAllah()).filter(n => n.name !== question.name).sort(() => 0.5 - Math.random()).slice(0, 3);
     options.push(question);
     options = options.sort(() => 0.5 - Math.random());
-
-    ctx.reply(
-        `What is the meaning of *${question.name}*?`,
+    
+    let timeLeft = 10;
+    const message = await ctx.replyWithMarkdown(
+        `⏳ *${timeLeft}s remaining*\n\nWhat is the meaning of *${question.name}*?`,
         Markup.inlineKeyboard(
-            options.map((opt) => [
-                Markup.button.callback(opt.meaning, `answer_${userId}_${opt.name === question.name}`)
-            ])
+            options.map((opt) => [Markup.button.callback(opt.meaning, `answer_${userId}_${opt.name === question.name}`)])
         )
     );
 
-    // Set a timeout for 10 seconds
-    session.timer = setTimeout(async () => {
-        ctx.reply("⏳ Time's up! Moving to the next question.");
-        session.current++;
-        sendQuestion(ctx, userId);
-    }, 10000); // 10 seconds
+    const timer = setInterval(async () => {
+        timeLeft--;
+        if (timeLeft <= 0) {
+            clearInterval(timer);
+            session.current++;
+            sendQuestion(ctx, userId);
+            return;
+        }
+        try {
+            await ctx.telegram.editMessageText(ctx.chat.id, message.message_id, undefined,
+                `⏳ *${timeLeft}s remaining*\n\nWhat is the meaning of *${question.name}*?`,
+                { parse_mode: "Markdown", reply_markup: message.reply_markup }
+            );
+        } catch (error) {}
+    }, 1000);
 }
-
-bot.action(/answer_(\d+)_(true|false)/, async (ctx) => {
-    const userId = parseInt(ctx.match[1]);
-    const correct = ctx.match[2] === 'true';
-
-    if (!userSessions[userId]) return;
-
-    // Clear the timeout since the user answered
-    clearTimeout(userSessions[userId].timer);
-
-    if (correct) userSessions[userId].score++;
-    userSessions[userId].current++;
-
-    ctx.reply(correct ? "✅ Correct!" : "❌ Wrong!");
-    sendQuestion(ctx, userId);
-});
-
-bot.hears('Quit Quiz', (ctx) => {
-    const userId = ctx.from.id;
-    delete userSessions[userId];
-    ctx.reply("Quiz stopped.", Markup.keyboard([['Start Quiz'], ['User Progress', 'Leaderboard']]).resize());
-});
-
-bot.hears('User Progress', async (ctx) => {
-    const userId = ctx.from.id;
-    const progress = await getUserProgress(userId);
-    ctx.reply(`Your current score: ${progress.score}`);
-});
 
 bot.hears('Leaderboard', async (ctx) => {
     const leaderboardSnap = await getDocs(collection(db, "user_progress"));
     let leaderboard = [];
     for (const docSnap of leaderboardSnap.docs) {
         const data = docSnap.data();
-        const username = await getUsername(docSnap.id);
-        leaderboard.push({ username, score: data.score });
+        leaderboard.push({ username: data.username || `User${docSnap.id}`, score: data.score });
     }
     leaderboard.sort((a, b) => b.score - a.score);
-    const message = "🏆 Leaderboard 🏆\n\n" +
-        leaderboard.slice(0, 5).map((entry, i) => `${i + 1}. @${entry.username}: ${entry.score} points`).join('\n');
+    const message = "🏆 Leaderboard 🏆\n\n" + leaderboard.slice(0, 5).map((entry, i) => `${i + 1}. @${entry.username}: ${entry.score} points`).join('\n');
     ctx.reply(message);
 });
 
